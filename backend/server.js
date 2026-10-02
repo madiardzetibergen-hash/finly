@@ -13,46 +13,67 @@ const app = express();
 
 const PORT = process.env.PORT || 5000;
 
-
 // ========================================
 // MIDDLEWARE
 // ========================================
 
+const allowedOrigins = [
+    "http://localhost:5173",
+    process.env.FRONTEND_URL
+].filter(Boolean);
+
 app.use(
     cors({
-        origin: "http://localhost:5173",
+        origin(origin, callback) {
+            // Разрешаем запросы без origin:
+            // Postman, server-to-server, health checks и т.д.
+            if (!origin) {
+                return callback(null, true);
+            }
+
+            if (allowedOrigins.includes(origin)) {
+                return callback(null, true);
+            }
+
+            return callback(
+                new Error(`CORS blocked for origin: ${origin}`)
+            );
+        },
+
         credentials: true
     })
 );
 
 app.use(express.json());
 
+// ========================================
+// DATABASE — NEON
+// ========================================
 
-// ========================================
-// DATABASE
-// ========================================
+if (!process.env.DATABASE_URL) {
+    throw new Error(
+        "DATABASE_URL is not set. Add your Neon connection string in Vercel Environment Variables."
+    );
+}
 
 const pool = new Pool({
-    host: process.env.DB_HOST,
-    port: process.env.DB_PORT,
-    database: process.env.DB_NAME,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD
+    connectionString: process.env.DATABASE_URL,
+
+    ssl: {
+        rejectUnauthorized: false
+    }
 });
 
-
-// Проверяем подключение к PostgreSQL
-
+// Проверяем подключение к Neon PostgreSQL
 pool.connect()
     .then((client) => {
-        console.log("✅ PostgreSQL connected");
+        console.log("✅ Neon PostgreSQL connected");
         client.release();
     })
     .catch((error) => {
-        console.error("❌ PostgreSQL connection error:");
+        console.error("❌ Neon PostgreSQL connection error:");
         console.error(error.message);
     });
-
 
 // ========================================
 // JWT
@@ -60,6 +81,11 @@ pool.connect()
 
 const JWT_SECRET = process.env.JWT_SECRET;
 
+if (!JWT_SECRET) {
+    console.warn(
+        "⚠️ JWT_SECRET is not configured in Environment Variables"
+    );
+}
 
 // ========================================
 // HELPER: CREATE TOKEN
@@ -71,13 +97,14 @@ function createToken(user) {
             id: user.id,
             email: user.email
         },
+
         JWT_SECRET,
+
         {
             expiresIn: "7d"
         }
     );
 }
-
 
 // ========================================
 // AUTH MIDDLEWARE
@@ -113,7 +140,6 @@ function authenticateToken(req, res, next) {
     }
 }
 
-
 // ========================================
 // ROOT
 // ========================================
@@ -126,21 +152,28 @@ app.get("/", (req, res) => {
     });
 });
 
-
 // ========================================
 // HEALTH CHECK
 // ========================================
 
 app.get("/api/health", async (req, res) => {
     try {
-        const result = await pool.query("SELECT NOW()");
+        const result = await pool.query(`
+            SELECT 
+                NOW() AS time,
+                current_database() AS database
+        `);
 
         res.json({
             status: "ok",
             database: "connected",
-            time: result.rows[0].now
+            databaseName: result.rows[0].database,
+            time: result.rows[0].time
         });
+
     } catch (error) {
+        console.error("HEALTH CHECK ERROR:", error);
+
         res.status(500).json({
             status: "error",
             database: "disconnected",
@@ -148,7 +181,6 @@ app.get("/api/health", async (req, res) => {
         });
     }
 });
-
 
 // ========================================
 // REGISTER
@@ -174,12 +206,17 @@ app.post("/api/auth/register", async (req, res) => {
             });
         }
 
-
         // Проверяем существование пользователя
 
         const existingUser = await pool.query(
-            "SELECT id FROM users WHERE email = $1",
-            [email.toLowerCase()]
+            `
+            SELECT id
+            FROM users
+            WHERE email = $1
+            `,
+            [
+                email.toLowerCase()
+            ]
         );
 
         if (existingUser.rows.length > 0) {
@@ -188,11 +225,12 @@ app.post("/api/auth/register", async (req, res) => {
             });
         }
 
-
         // Хешируем пароль
 
-        const passwordHash = await bcrypt.hash(password, 10);
-
+        const passwordHash = await bcrypt.hash(
+            password,
+            10
+        );
 
         // Создаем пользователя
 
@@ -203,8 +241,20 @@ app.post("/api/auth/register", async (req, res) => {
                 password_hash,
                 name
             )
-            VALUES ($1, $2, $3)
-            RETURNING id, email, name, currency, timezone, created_at
+
+            VALUES (
+                $1,
+                $2,
+                $3
+            )
+
+            RETURNING
+                id,
+                email,
+                name,
+                currency,
+                timezone,
+                created_at
             `,
             [
                 email.toLowerCase(),
@@ -215,26 +265,89 @@ app.post("/api/auth/register", async (req, res) => {
 
         const user = userResult.rows[0];
 
-
-        // Создаем стандартные категории
+        // ========================================
+        // DEFAULT CATEGORIES
+        // ========================================
 
         const defaultCategories = [
-            ["Еда", "expense", "utensils"],
-            ["Транспорт", "expense", "car"],
-            ["Покупки", "expense", "shopping-bag"],
-            ["Развлечения", "expense", "gamepad-2"],
-            ["Дом", "expense", "house"],
-            ["Здоровье", "expense", "heart-pulse"],
-            ["Образование", "expense", "graduation-cap"],
-            ["Подписки", "expense", "credit-card"],
-            ["Другое", "expense", "ellipsis"],
+            [
+                "Еда",
+                "expense",
+                "utensils"
+            ],
 
-            ["Зарплата", "income", "briefcase"],
-            ["Подработка", "income", "wallet"],
-            ["Фриланс", "income", "laptop"],
-            ["Другое", "income", "ellipsis"]
+            [
+                "Транспорт",
+                "expense",
+                "car"
+            ],
+
+            [
+                "Покупки",
+                "expense",
+                "shopping-bag"
+            ],
+
+            [
+                "Развлечения",
+                "expense",
+                "gamepad-2"
+            ],
+
+            [
+                "Дом",
+                "expense",
+                "house"
+            ],
+
+            [
+                "Здоровье",
+                "expense",
+                "heart-pulse"
+            ],
+
+            [
+                "Образование",
+                "expense",
+                "graduation-cap"
+            ],
+
+            [
+                "Подписки",
+                "expense",
+                "credit-card"
+            ],
+
+            [
+                "Другое",
+                "expense",
+                "ellipsis"
+            ],
+
+            [
+                "Зарплата",
+                "income",
+                "briefcase"
+            ],
+
+            [
+                "Подработка",
+                "income",
+                "wallet"
+            ],
+
+            [
+                "Фриланс",
+                "income",
+                "laptop"
+            ],
+
+            [
+                "Другое",
+                "income",
+                "ellipsis"
+            ]
         ];
-
 
         for (const category of defaultCategories) {
             await pool.query(
@@ -245,7 +358,13 @@ app.post("/api/auth/register", async (req, res) => {
                     type,
                     icon
                 )
-                VALUES ($1, $2, $3, $4)
+
+                VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    $4
+                )
                 `,
                 [
                     user.id,
@@ -256,11 +375,9 @@ app.post("/api/auth/register", async (req, res) => {
             );
         }
 
-
         // Создаем JWT
 
         const token = createToken(user);
-
 
         res.status(201).json({
             message: "User registered successfully",
@@ -271,14 +388,16 @@ app.post("/api/auth/register", async (req, res) => {
         });
 
     } catch (error) {
-        console.error("REGISTER ERROR:", error);
+        console.error(
+            "REGISTER ERROR:",
+            error
+        );
 
         res.status(500).json({
             message: "Server error"
         });
     }
 });
-
 
 // ========================================
 // LOGIN
@@ -291,13 +410,11 @@ app.post("/api/auth/login", async (req, res) => {
             password
         } = req.body;
 
-
         if (!email || !password) {
             return res.status(400).json({
                 message: "Email and password are required"
             });
         }
-
 
         const result = await pool.query(
             `
@@ -305,9 +422,10 @@ app.post("/api/auth/login", async (req, res) => {
             FROM users
             WHERE email = $1
             `,
-            [email.toLowerCase()]
+            [
+                email.toLowerCase()
+            ]
         );
-
 
         if (result.rows.length === 0) {
             return res.status(401).json({
@@ -315,9 +433,7 @@ app.post("/api/auth/login", async (req, res) => {
             });
         }
 
-
         const user = result.rows[0];
-
 
         // Проверяем пароль
 
@@ -326,16 +442,13 @@ app.post("/api/auth/login", async (req, res) => {
             user.password_hash
         );
 
-
         if (!passwordValid) {
             return res.status(401).json({
                 message: "Invalid email or password"
             });
         }
 
-
         const token = createToken(user);
-
 
         res.json({
             message: "Login successful",
@@ -344,16 +457,24 @@ app.post("/api/auth/login", async (req, res) => {
 
             user: {
                 id: user.id,
+
                 email: user.email,
+
                 name: user.name,
+
                 avatar_url: user.avatar_url,
+
                 currency: user.currency,
+
                 timezone: user.timezone
             }
         });
 
     } catch (error) {
-        console.error("LOGIN ERROR:", error);
+        console.error(
+            "LOGIN ERROR:",
+            error
+        );
 
         res.status(500).json({
             message: "Server error"
@@ -361,17 +482,17 @@ app.post("/api/auth/login", async (req, res) => {
     }
 });
 
-
 // ========================================
 // GET CURRENT USER
 // ========================================
 
 app.get(
     "/api/auth/me",
+
     authenticateToken,
+
     async (req, res) => {
         try {
-
             const result = await pool.query(
                 `
                 SELECT
@@ -382,12 +503,15 @@ app.get(
                     currency,
                     timezone,
                     created_at
+
                 FROM users
+
                 WHERE id = $1
                 `,
-                [req.user.id]
+                [
+                    req.user.id
+                ]
             );
-
 
             if (result.rows.length === 0) {
                 return res.status(404).json({
@@ -395,13 +519,15 @@ app.get(
                 });
             }
 
-
             res.json({
                 user: result.rows[0]
             });
 
         } catch (error) {
-            console.error("GET USER ERROR:", error);
+            console.error(
+                "GET USER ERROR:",
+                error
+            );
 
             res.status(500).json({
                 message: "Server error"
@@ -410,29 +536,36 @@ app.get(
     }
 );
 
-
 // ========================================
 // CATEGORIES
 // ========================================
 
-
-// GET categories
+// ========================================
+// GET CATEGORIES
+// ========================================
 
 app.get(
     "/api/categories",
+
     authenticateToken,
+
     async (req, res) => {
-
         try {
-
             const result = await pool.query(
                 `
                 SELECT *
+
                 FROM categories
+
                 WHERE user_id = $1
-                ORDER BY type, name
+
+                ORDER BY
+                    type,
+                    name
                 `,
-                [req.user.id]
+                [
+                    req.user.id
+                ]
             );
 
             res.json({
@@ -440,27 +573,29 @@ app.get(
             });
 
         } catch (error) {
-
-            console.error(error);
+            console.error(
+                "GET CATEGORIES ERROR:",
+                error
+            );
 
             res.status(500).json({
                 message: "Server error"
             });
-
         }
     }
 );
 
-
-// CREATE category
+// ========================================
+// CREATE CATEGORY
+// ========================================
 
 app.post(
     "/api/categories",
+
     authenticateToken,
+
     async (req, res) => {
-
         try {
-
             const {
                 name,
                 type,
@@ -468,20 +603,22 @@ app.post(
                 color
             } = req.body;
 
-
             if (!name || !type) {
                 return res.status(400).json({
                     message: "Name and type are required"
                 });
             }
 
-
-            if (!["expense", "income"].includes(type)) {
+            if (
+                ![
+                    "expense",
+                    "income"
+                ].includes(type)
+            ) {
                 return res.status(400).json({
                     message: "Type must be expense or income"
                 });
             }
-
 
             const result = await pool.query(
                 `
@@ -492,7 +629,15 @@ app.post(
                     icon,
                     color
                 )
-                VALUES ($1, $2, $3, $4, $5)
+
+                VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    $4,
+                    $5
+                )
+
                 RETURNING *
                 `,
                 [
@@ -504,85 +649,97 @@ app.post(
                 ]
             );
 
-
             res.status(201).json({
                 category: result.rows[0]
             });
 
         } catch (error) {
-
-            console.error(error);
+            console.error(
+                "CREATE CATEGORY ERROR:",
+                error
+            );
 
             res.status(500).json({
                 message: "Server error"
             });
-
         }
     }
 );
-
 
 // ========================================
 // EXPENSES
 // ========================================
 
-
-// GET expenses
+// ========================================
+// GET EXPENSES
+// ========================================
 
 app.get(
     "/api/expenses",
+
     authenticateToken,
+
     async (req, res) => {
-
         try {
-
             const result = await pool.query(
                 `
                 SELECT
                     expenses.*,
-                    categories.name AS category_name,
-                    categories.icon AS category_icon,
-                    categories.color AS category_color
+
+                    categories.name
+                        AS category_name,
+
+                    categories.icon
+                        AS category_icon,
+
+                    categories.color
+                        AS category_color
 
                 FROM expenses
 
                 JOIN categories
-                    ON expenses.category_id = categories.id
+                    ON expenses.category_id =
+                       categories.id
 
                 WHERE expenses.user_id = $1
 
-                ORDER BY expenses.date DESC, expenses.created_at DESC
+                ORDER BY
+                    expenses.date DESC,
+                    expenses.created_at DESC
                 `,
-                [req.user.id]
+                [
+                    req.user.id
+                ]
             );
-
 
             res.json({
                 expenses: result.rows
             });
 
         } catch (error) {
-
-            console.error(error);
+            console.error(
+                "GET EXPENSES ERROR:",
+                error
+            );
 
             res.status(500).json({
                 message: "Server error"
             });
-
         }
     }
 );
 
-
-// CREATE expense
+// ========================================
+// CREATE EXPENSE
+// ========================================
 
 app.post(
     "/api/expenses",
+
     authenticateToken,
+
     async (req, res) => {
-
         try {
-
             const {
                 category_id,
                 amount,
@@ -592,13 +749,11 @@ app.post(
                 is_recurring
             } = req.body;
 
-
             if (!category_id || !amount) {
                 return res.status(400).json({
                     message: "Category and amount are required"
                 });
             }
-
 
             if (Number(amount) <= 0) {
                 return res.status(400).json({
@@ -606,13 +761,14 @@ app.post(
                 });
             }
 
-
-            // Проверяем категорию
+            // Проверяем принадлежность категории пользователю
 
             const categoryResult = await pool.query(
                 `
                 SELECT id
+
                 FROM categories
+
                 WHERE id = $1
                   AND user_id = $2
                   AND type = 'expense'
@@ -623,13 +779,11 @@ app.post(
                 ]
             );
 
-
             if (categoryResult.rows.length === 0) {
                 return res.status(400).json({
                     message: "Invalid expense category"
                 });
             }
-
 
             const result = await pool.query(
                 `
@@ -647,10 +801,16 @@ app.post(
                     $1,
                     $2,
                     $3,
-                    COALESCE($4, CURRENT_DATE),
+                    COALESCE(
+                        $4,
+                        CURRENT_DATE
+                    ),
                     $5,
                     $6,
-                    COALESCE($7, FALSE)
+                    COALESCE(
+                        $7,
+                        FALSE
+                    )
                 )
 
                 RETURNING *
@@ -666,34 +826,36 @@ app.post(
                 ]
             );
 
-
             res.status(201).json({
                 message: "Expense created",
+
                 expense: result.rows[0]
             });
 
         } catch (error) {
-
-            console.error(error);
+            console.error(
+                "CREATE EXPENSE ERROR:",
+                error
+            );
 
             res.status(500).json({
                 message: "Server error"
             });
-
         }
     }
 );
 
-
-// DELETE expense
+// ========================================
+// DELETE EXPENSE
+// ========================================
 
 app.delete(
     "/api/expenses/:id",
+
     authenticateToken,
+
     async (req, res) => {
-
         try {
-
             const result = await pool.query(
                 `
                 DELETE FROM expenses
@@ -709,91 +871,100 @@ app.delete(
                 ]
             );
 
-
             if (result.rows.length === 0) {
                 return res.status(404).json({
                     message: "Expense not found"
                 });
             }
 
-
             res.json({
                 message: "Expense deleted"
             });
 
         } catch (error) {
-
-            console.error(error);
+            console.error(
+                "DELETE EXPENSE ERROR:",
+                error
+            );
 
             res.status(500).json({
                 message: "Server error"
             });
-
         }
     }
 );
-
 
 // ========================================
 // INCOME
 // ========================================
 
-
-// GET income
+// ========================================
+// GET INCOME
+// ========================================
 
 app.get(
     "/api/income",
+
     authenticateToken,
+
     async (req, res) => {
-
         try {
-
             const result = await pool.query(
                 `
                 SELECT
                     income.*,
-                    categories.name AS category_name,
-                    categories.icon AS category_icon
+
+                    categories.name
+                        AS category_name,
+
+                    categories.icon
+                        AS category_icon
 
                 FROM income
 
                 LEFT JOIN categories
-                    ON income.category_id = categories.id
+                    ON income.category_id =
+                       categories.id
 
                 WHERE income.user_id = $1
 
-                ORDER BY income.date DESC, income.created_at DESC
+                ORDER BY
+                    income.date DESC,
+                    income.created_at DESC
                 `,
-                [req.user.id]
+                [
+                    req.user.id
+                ]
             );
-
 
             res.json({
                 income: result.rows
             });
 
         } catch (error) {
-
-            console.error(error);
+            console.error(
+                "GET INCOME ERROR:",
+                error
+            );
 
             res.status(500).json({
                 message: "Server error"
             });
-
         }
     }
 );
 
-
-// CREATE income
+// ========================================
+// CREATE INCOME
+// ========================================
 
 app.post(
     "/api/income",
+
     authenticateToken,
+
     async (req, res) => {
-
         try {
-
             const {
                 category_id,
                 amount,
@@ -802,20 +973,17 @@ app.post(
                 comment
             } = req.body;
 
-
             if (!amount || !source) {
                 return res.status(400).json({
                     message: "Amount and source are required"
                 });
             }
 
-
             if (Number(amount) <= 0) {
                 return res.status(400).json({
                     message: "Amount must be greater than 0"
                 });
             }
-
 
             const result = await pool.query(
                 `
@@ -833,7 +1001,10 @@ app.post(
                     $2,
                     $3,
                     $4,
-                    COALESCE($5, CURRENT_DATE),
+                    COALESCE(
+                        $5,
+                        CURRENT_DATE
+                    ),
                     $6
                 )
 
@@ -849,43 +1020,55 @@ app.post(
                 ]
             );
 
-
             res.status(201).json({
                 message: "Income created",
+
                 income: result.rows[0]
             });
 
         } catch (error) {
-
-            console.error(error);
+            console.error(
+                "CREATE INCOME ERROR:",
+                error
+            );
 
             res.status(500).json({
                 message: "Server error"
             });
-
         }
     }
 );
 
-
 // ========================================
-// START SERVER
+// LOCAL SERVER
 // ========================================
 
-app.listen(PORT, () => {
+// Локально запускаем обычный Express.
+// На Vercel app экспортируется как serverless function.
 
-    console.log(`
+if (!process.env.VERCEL) {
+    app.listen(
+        PORT,
+
+        () => {
+            console.log(`
 ========================================
 💰 Personal Finance API
 ========================================
 
-🚀 Server: http://localhost:${PORT}
+🚀 Server:
+http://localhost:${PORT}
 
-📡 API:    http://localhost:${PORT}/api
+📡 API:
+http://localhost:${PORT}/api
 
-❤️ Health: http://localhost:${PORT}/api/health
+❤️ Health:
+http://localhost:${PORT}/api/health
 
 ========================================
-    `);
+            `);
+        }
+    );
+}
 
-});
+export default app;
